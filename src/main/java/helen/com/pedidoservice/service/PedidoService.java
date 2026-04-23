@@ -5,7 +5,6 @@ import helen.com.pedidoservice.exception.BusinessException;
 import helen.com.pedidoservice.exception.ResourceNotFoundException;
 import helen.com.pedidoservice.mapper.PedidoMapper;
 import helen.com.pedidoservice.messaging.PedidoProducer;
-import helen.com.pedidoservice.model.ItemPedido;
 import helen.com.pedidoservice.model.Pedido;
 import helen.com.pedidoservice.model.StatusPedido;
 import helen.com.pedidoservice.repository.PedidoRepository;
@@ -29,12 +28,13 @@ public class PedidoService {
     @Transactional
     public PedidoResponseDTO criar(PedidoCreateDTO dto){
         Pedido pedido = mapper.toEntity(dto);
-
         pedido.setStatus(StatusPedido.AGUARDANDO_ESTOQUE);
 
         pedido = repository.save(pedido);
 
+        EventMetadata metadata  = EventMetadata.create(null, null);
         PedidoCriadoEvent evento = new PedidoCriadoEvent(
+                metadata,
                 pedido.getId(),
                 pedido.getClienteId(),
                 dto.itens()
@@ -42,16 +42,14 @@ public class PedidoService {
 
         producer.enviarParaEstoque(evento);
 
-        log.info("Pedido criado com sucesso {}", pedido.getId());
+        log.info("Pedido criado pedidoId={} status={} correlationId={}",
+                pedido.getId(), pedido.getStatus(), metadata.correlationId());
         return mapper.toDTO(pedido);
     }
 
+    @Transactional(readOnly = true)
     public PedidoResponseDTO buscarPorId(UUID id) {
-        log.info("Buscando pedido {}", id);
-        Pedido pedido = repository.findByIdAndAtivoTrue(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Pedido não encontrado."));
-
-        return mapper.toDTO(pedido);
+        return mapper.toDTO(buscarPedido(id));
     }
 
     public Page<PedidoResponseDTO> listar(Pageable pageable) {
@@ -61,35 +59,45 @@ public class PedidoService {
 
     @Transactional
     public PedidoResponseDTO atualizar(UUID id, PedidoUpdateDTO dto) {
-        Pedido pedido = repository.findByIdAndAtivoTrue(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Pedido não encontrado"));
+        Pedido pedido = buscarPedido(id);
+        validarPedidoEditavel(pedido);
 
-        if(!pedido.getStatus().equals(StatusPedido.AGUARDANDO_ESTOQUE)) {
-            throw new BusinessException("Pedido não pode ser alterado nesse estado");
+        mapper.applyUpdate(pedido, dto);
+        repository.save(pedido);
+
+        log.info("Pedido atualizado integralmente pedidoId={}", id);
+        return mapper.toDTO(pedido);
+    }
+
+    @Transactional
+    public PedidoResponseDTO atualizarParcial(UUID id, PedidoPatchDTO dto) {
+        Pedido pedido = buscarPedido(id);
+        validarPedidoEditavel(pedido);
+
+        if (dto.clienteId() != null) {
+            pedido.setClienteId(dto.clienteId());
+        }
+        if (dto.itens() != null) {
+            pedido.setItens(mapper.toItemEntities(dto.itens()));
         }
 
-        pedido.setClienteId(dto.clienteId());
-
-        pedido.setItens(dto.itens().stream().map(i -> {
-            ItemPedido item = new ItemPedido();
-            item.setProdutoId(i.produtoId());
-            item.setNome(i.nome());
-            item.setQuantidade(i.quantidade());
-
-            item.setPedido(pedido);
-
-            return item;
-        }).toList());
-
         repository.save(pedido);
-        log.info("Pedido atualizado {}", id);
+
+        log.info("Pedido atualizado parcialmente pedidoId={}", id);
         return mapper.toDTO(pedido);
     }
 
     @Transactional
     public void cancelar(UUID id) {
-        Pedido pedido = repository.findByIdAndAtivoTrue(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Pedido não encontrado"));
+        Pedido pedido = buscarPedido(id);
+
+        if(pedido.getStatus() == StatusPedido.FINALIZADO) {
+            throw new BusinessException("Pedido finalizado não pode ser cancelado");
+        }
+        if(pedido.getStatus() == StatusPedido.CANCELADO) {
+            throw new BusinessException("Pedido ja esta cancelado");
+        }
+
         pedido.setStatus(StatusPedido.CANCELADO);
         repository.save(pedido);
         log.info("Pedido cancelado {}", id);
@@ -98,106 +106,109 @@ public class PedidoService {
     @Transactional
     public void processarEstoqueSucesso(EstoqueConfirmadoEvent evento) {
 
-        UUID pedidoId = evento.pedidoId();
+        Pedido pedido = buscarPedido(evento.pedidoId());
 
-        Pedido pedido = buscarPedido(pedidoId);
-
-        if(!pedido.getStatus().equals(StatusPedido.AGUARDANDO_ESTOQUE)) {
-            log.warn("Pedido {} ignorado - estado inválido {}", pedidoId, pedido.getStatus());
+        if (pedido.getStatus() != StatusPedido.AGUARDANDO_ESTOQUE) {
+            log.warn("Pedido ignorado no estoque.sucesso pedidoId={} statusAtual={}", evento.pedidoId(), pedido.getStatus());
             return;
         }
 
         pedido.setStatus(StatusPedido.AGUARDANDO_EMAIL);
         repository.save(pedido);
 
-       producer.enviarEmail(new EmailSolicitadoEvent(
-                pedidoId
-        ));
+        EventMetadata metadata = EventMetadata.create(evento.metadata().correlationId(), evento.metadata().traceId());
+        producer.enviarEmail(new EmailSolicitadoEvent(metadata, evento.pedidoId()));
 
-        log.info("Pedido {} atualizado para AGUARDANDO_EMAIL", pedidoId);
+        log.info("Pedido avancou para AGUARDANDO_EMAIL pedidoId={} correlationId={}",
+                evento.pedidoId(), metadata.correlationId());
     }
 
     @Transactional
     public void processarEstoqueFalha(EstoqueFalhouEvent evento) {
 
-        UUID pedidoId = evento.pedidoId();
+        Pedido pedido = buscarPedido(evento.pedidoId());
 
-        log.error("Falha no estoque para pedido {} - Motivo: {}",
-                pedidoId, evento.motivo());
-
-        Pedido pedido = buscarPedido(pedidoId);
+        if (pedido.getStatus() != StatusPedido.AGUARDANDO_ESTOQUE) {
+            log.warn("Pedido ignorado no estoque.falha pedidoId={} statusAtual={}", evento.pedidoId(), pedido.getStatus());
+            return;
+        }
 
         pedido.setStatus(StatusPedido.CANCELADO);
-
         repository.save(pedido);
 
-        log.info("Pedido {} cancelado por falha no estoque", pedidoId);
+        log.error("Pedido cancelado por falha de estoque pedidoId={} motivo={} correlationId={}",
+                evento.pedidoId(), evento.motivo(), evento.metadata().correlationId());
     }
 
     @Transactional
     public void processarEmailSucesso(EmailEnviadoEvent evento) {
 
-        UUID pedidoId = evento.pedidoId();
+        Pedido pedido = buscarPedido(evento.pedidoId());
 
-        log.info("Email enviado para pedido {}", pedidoId);
-
-        Pedido pedido = buscarPedido(pedidoId);
-
-        if (!pedido.getStatus().equals(StatusPedido.AGUARDANDO_EMAIL)) {
-            log.warn("Pedido {} ignorado no email - estado {}", pedidoId, pedido.getStatus());
+        if (pedido.getStatus() != StatusPedido.AGUARDANDO_EMAIL) {
+            log.warn("Pedido ignorado no email.sucesso pedidoId={} statusAtual={}", evento.pedidoId(), pedido.getStatus());
             return;
         }
 
         pedido.setStatus(StatusPedido.AGUARDANDO_NOTA);
         repository.save(pedido);
 
-        NotaSolicitadaEvent notaEvent = new NotaSolicitadaEvent(pedidoId);
-        producer.enviarNota(notaEvent);
+        EventMetadata metadata = EventMetadata.create(evento.metadata().correlationId(), evento.metadata().traceId());
+        producer.enviarNota(new NotaSolicitadaEvent(metadata, evento.pedidoId()));
+
+        log.info("Pedido avancou para AGUARDANDO_NOTA pedidoId={} correlationId={}",
+                evento.pedidoId(), metadata.correlationId());
     }
 
     @Transactional
     public void processarEmailFalha(EmailFalhouEvent evento) {
 
-        UUID pedidoId = evento.pedidoId();
+        Pedido pedido = buscarPedido(evento.pedidoId());
 
-        log.error("Falha ao enviar email do pedido {} - Motivo: {}", pedidoId, evento.motivo());
-
-        Pedido pedido = buscarPedido(pedidoId);
+        if (pedido.getStatus() != StatusPedido.AGUARDANDO_EMAIL) {
+            log.warn("Pedido ignorado no email.falha pedidoId={} statusAtual={}", evento.pedidoId(), pedido.getStatus());
+            return;
+        }
 
         pedido.setStatus(StatusPedido.CANCELADO);
         repository.save(pedido);
+
+        log.error("Pedido cancelado por falha de email pedidoId={} motivo={} correlationId={}",
+                evento.pedidoId(), evento.motivo(), evento.metadata().correlationId());
     }
 
     @Transactional
     public void finalizarPedido(NotaEmitidaEvent evento) {
 
-        UUID pedidoId = evento.pedidoId();
+        Pedido pedido = buscarPedido(evento.pedidoId());
 
-        log.info("Nota emitida para pedido {}", pedidoId);
-
-        Pedido pedido = buscarPedido(pedidoId);
-
-        if (!pedido.getStatus().equals(StatusPedido.AGUARDANDO_NOTA)) {
-            log.warn("Pedido {} ignorado na nota - estado {}", pedidoId, pedido.getStatus());
+        if (pedido.getStatus() != StatusPedido.AGUARDANDO_NOTA) {
+            log.warn("Pedido ignorado no nota.sucesso pedidoId={} statusAtual={}", evento.pedidoId(), pedido.getStatus());
             return;
         }
 
         pedido.setStatus(StatusPedido.FINALIZADO);
         repository.save(pedido);
 
-        log.info("Pedido {} FINALIZADO", pedidoId);
+        log.info("Pedido finalizado pedidoId={} correlationId={}",
+                evento.pedidoId(), evento.metadata().correlationId());
     }
 
     @Transactional
     public void processarNotaFalha(NotaFalhouEvent evento) {
-        UUID pedidoId = evento.pedidoId();
 
-        Pedido pedido = buscarPedido(pedidoId);
+        Pedido pedido = buscarPedido(evento.pedidoId());
+
+        if (pedido.getStatus() != StatusPedido.AGUARDANDO_NOTA) {
+            log.warn("Pedido ignorado no nota.falha pedidoId={} statusAtual={}", evento.pedidoId(), pedido.getStatus());
+            return;
+        }
 
         pedido.setStatus(StatusPedido.CANCELADO);
         repository.save(pedido);
 
-        log.error("Pedido {} cancelado por falha na nota", pedidoId);
+        log.error("Pedido cancelado por falha de nota pedidoId={} motivo={} correlationId={}",
+                evento.pedidoId(), evento.motivo(), evento.metadata().correlationId());
     }
 
     private Pedido buscarPedido(UUID id) {
@@ -205,4 +216,9 @@ public class PedidoService {
                 .orElseThrow(() -> new ResourceNotFoundException("Pedido não encontrado"));
     }
 
+    private void validarPedidoEditavel(Pedido pedido) {
+        if (pedido.getStatus() != StatusPedido.AGUARDANDO_ESTOQUE) {
+            throw new BusinessException("Pedido nao pode ser alterado nesse estado");
+        }
+    }
 }
