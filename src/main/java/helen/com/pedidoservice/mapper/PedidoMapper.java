@@ -30,6 +30,6 @@ public class PedidoMapper {
         List<String> itens = pedido.getItens().stream()
                 .map(i -> i.getNome() + " x" + i.getQuantidade())
                 .toList();
-        return new PedidoResponseDTO(pedido.getId(), pedido.getClienteId(), itens);
+        return new PedidoResponseDTO(pedido.getId(), pedido.getClienteId(), pedido.getStatus(), itens);
    }
 }
