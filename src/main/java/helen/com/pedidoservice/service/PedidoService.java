@@ -1,5 +1,8 @@
 package helen.com.pedidoservice.service;
 
+import feign.FeignException;
+import helen.com.pedidoservice.client.ProdutoClient;
+import helen.com.pedidoservice.client.ProdutoDTO;
 import helen.com.pedidoservice.dto.*;
 import helen.com.pedidoservice.exception.BusinessException;
 import helen.com.pedidoservice.exception.ResourceNotFoundException;
@@ -24,9 +27,12 @@ public class PedidoService {
     private final PedidoRepository repository;
     private final PedidoMapper mapper;
     private final PedidoProducer producer;
+    private final ProdutoClient produtoClient;
 
     @Transactional
     public PedidoResponseDTO criar(PedidoCreateDTO dto){
+        dto.itens().forEach(item -> validarProduto(item.produtoId()));
+
         Pedido pedido = mapper.toEntity(dto);
         pedido.setStatus(StatusPedido.AGUARDANDO_ESTOQUE);
 
@@ -209,6 +215,23 @@ public class PedidoService {
 
         log.error("Pedido cancelado por falha de nota pedidoId={} motivo={} correlationId={}",
                 evento.pedidoId(), evento.motivo(), evento.metadata().correlationId());
+    }
+
+    private void validarProduto(UUID produtoId) {
+        ProdutoDTO produto;
+
+        try {
+            produto = produtoClient.buscarPorId(produtoId).dados();
+        } catch (FeignException.NotFound e) {
+            throw new BusinessException("Produto não encontrado: " + produtoId);
+        } catch (FeignException e) {
+            log.error("Falha ao consultar produto-service produtoId={}", produtoId, e);
+            throw new BusinessException("Não foi possível validar o produto no momento, tente novamente");
+        }
+
+        if (!produto.ativo()) {
+            throw new BusinessException("Produto inativo: " + produtoId);
+        }
     }
 
     private Pedido buscarPedido(UUID id) {

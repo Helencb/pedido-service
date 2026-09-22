@@ -14,7 +14,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
-import tools.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.time.Instant;
 import java.util.List;
@@ -99,7 +99,7 @@ public class OutboxPublisherService {
             );
 
             CorrelationData.Confirm confirm = correlationData.getFuture().get(5, TimeUnit.SECONDS);
-            if (!confirm.ack()) {
+            if (!confirm.isAck()) {
                 throw new IllegalStateException("Broker retornou nack para o evento " + outboxEvent.getId());
             }
 

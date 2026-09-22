@@ -1,5 +1,7 @@
 package helen.com.pedidoservice.service;
 
+import helen.com.pedidoservice.client.ProdutoClient;
+import helen.com.pedidoservice.client.ProdutoDTO;
 import helen.com.pedidoservice.dto.*;
 import helen.com.pedidoservice.exception.BusinessException;
 import helen.com.pedidoservice.mapper.PedidoMapper;
@@ -31,6 +33,9 @@ public class PedidoServiceTest {
     @Mock
     private PedidoProducer producer;
 
+    @Mock
+    private ProdutoClient produtoClient;
+
     @InjectMocks
     private PedidoService service;
 
@@ -51,6 +56,8 @@ public class PedidoServiceTest {
         pedido.setClienteId(clienteId);
         pedido.setItens(List.of(new ItemPedido()));
 
+        when(produtoClient.buscarPorId(itemDTO.produtoId()))
+                .thenReturn(new ApiResponse<>(true, "ok", new ProdutoDTO(itemDTO.produtoId(), "Camiseta", null, true)));
         when(mapper.toEntity(dto)).thenReturn(pedido);
         when(repository.save(any(Pedido.class))).thenReturn(pedido);
         when(mapper.toDTO(pedido)).thenReturn(new PedidoResponseDTO(id, clienteId, StatusPedido.AGUARDANDO_ESTOQUE, List.of("Camiseta x2")));
@@ -62,6 +69,22 @@ public class PedidoServiceTest {
         verify(producer, times(1)).enviarParaEstoque(any(PedidoCriadoEvent.class));
         assertNotNull(resultado);
         assertEquals(pedido, pedido.getItens().get(0).getPedido());
+    }
+
+    @Test
+    void deveBloquearCriacaoQuandoProdutoInativo() {
+        UUID clienteId = UUID.randomUUID();
+        ItemPedidoDTO itemDTO = new ItemPedidoDTO(UUID.randomUUID(), "Camiseta", 2);
+        PedidoCreateDTO dto = new PedidoCreateDTO(clienteId, List.of(itemDTO));
+
+        when(produtoClient.buscarPorId(itemDTO.produtoId()))
+                .thenReturn(new ApiResponse<>(true, "ok", new ProdutoDTO(itemDTO.produtoId(), "Camiseta", null, false)));
+
+        BusinessException exception = assertThrows(BusinessException.class, () -> service.criar(dto));
+
+        assertTrue(exception.getMessage().contains("inativo"));
+        verify(repository, never()).save(any(Pedido.class));
+        verify(producer, never()).enviarParaEstoque(any());
     }
 
     @Test

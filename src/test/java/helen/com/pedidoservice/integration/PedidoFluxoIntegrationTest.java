@@ -1,5 +1,7 @@
 package helen.com.pedidoservice.integration;
 
+import helen.com.pedidoservice.client.ProdutoClient;
+import helen.com.pedidoservice.client.ProdutoDTO;
 import helen.com.pedidoservice.dto.*;
 import helen.com.pedidoservice.model.OutboxStatus;
 import helen.com.pedidoservice.model.StatusPedido;
@@ -10,12 +12,15 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest
 @ActiveProfiles("test")
@@ -29,13 +34,20 @@ public class PedidoFluxoIntegrationTest {
     @Autowired
     private OutboxEventRepository outboxEventRepository;
 
+    @MockitoBean
+    private ProdutoClient produtoClient;
+
     @Test
     void deveExecutarFluxoCompletoSemPublicarAutomaticamente() {
         UUID clienteId = UUID.randomUUID();
+        UUID produtoId = UUID.randomUUID();
         PedidoCreateDTO createDTO = new PedidoCreateDTO(
                 clienteId,
-                List.of(new ItemPedidoDTO(UUID.randomUUID(), "Notebook", 1))
+                List.of(new ItemPedidoDTO(produtoId, "Notebook", 1))
         );
+
+        when(produtoClient.buscarPorId(any()))
+                .thenReturn(new ApiResponse<>(true, "ok", new ProdutoDTO(produtoId, "Notebook", null, true)));
 
         PedidoResponseDTO criado = pedidoService.criar(createDTO);
         assertEquals(StatusPedido.AGUARDANDO_ESTOQUE, criado.status());
